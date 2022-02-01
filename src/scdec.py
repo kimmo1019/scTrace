@@ -16,27 +16,27 @@ class scDEC(object):
     def __init__(self, params):  
         super(scDEC, self).__init__()
         self.params = params
-        self.g_net = Generator(input_dim=params['z_dim'], output_dim = params['x_dim'],nb_layers=10, nb_units=512, concat_every_fcl=False)
+        self.g_net = Generator(input_dim=params['z_dim']+params['nb_classes'],z_dim = params['z_dim'], output_dim = params['x_dim'],nb_layers=10, nb_units=512, concat_every_fcl=False)
         self.h_net = Encoder(input_dim=params['x_dim'], output_dim = params['z_dim']+params['nb_classes'],feat_dim=params['z_dim'],nb_layers=10,nb_units=256)
-        self.dz_net = Discriminator(input_dim=params['z_dim'],name='dz_net',nb_layers=2,nb_units=256)
-        self.dx_net = Discriminator(input_dim=params['x_dim'],name='dx_net',nb_layers=2,nb_units=256)
+        self.dz_net = Discriminator(input_dim=params['z_dim'],model_name='dz_net',nb_layers=2,nb_units=256)
+        self.dx_net = Discriminator(input_dim=params['x_dim'],model_name='dx_net',nb_layers=2,nb_units=256)
         self.g_h_optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
         self.d_optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
-        self.z_sampler = Mixture_sampler(nb_classes=params['nb_classes'],N=10000,dim=params['x_dim'],sd=1)
+        self.z_sampler = Mixture_sampler(nb_classes=params['nb_classes'],N=10000,dim=params['z_dim'],sd=1)
         if params['data_type'] == 'scRNA-seq':
-            self.x_sampler = scRNA_Sampler(params)
+            self.x_sampler = scRNA_Sampler(params['dataset'])
         elif params['data_type'] == 'scATAC-seq':
-            self.x_sampler = scATAC_Sampler(params)
+            self.x_sampler = scATAC_Sampler(params['dataset'], has_label=params['has_label'])
         elif params['data_type'] == 'Joint':
-            self.x_sampler = Joint_Sampler(params)
+            self.x_sampler = Joint_Sampler(params['dataset'])
         else:
             print("Data type error")
             sys.exit()
-        
+        self.initilize_nets()
         now = datetime.datetime.now(dateutil.tz.tzlocal())
         self.timestamp = now.strftime('%Y%m%d_%H%M%S')
         
-        self.checkpoint_path = "checkpoints/train"
+        self.checkpoint_path = "checkpoints/%s" % self.timestamp
         if not os.path.exists(self.checkpoint_path):
             os.makedirs(self.checkpoint_path)
         
@@ -60,21 +60,20 @@ class scDEC(object):
                 "params": self.params,
         }
     
-    def discriminator_loss(self, real, generated):
-        loss_ce = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-        real_loss = loss_ce(tf.ones_like(real), real)
-        generated_loss = loss_ce(tf.zeros_like(generated), generated)
-        total_disc_loss = real_loss + generated_loss
-        return total_disc_loss * 0.5
-    
-    def mse_loss(self, data1, data2):
-        loss = tf.reduce_mean(tf.abs(data1 - data2))
-        return loss
-
+    def initilize_nets(self, print_summary = True):
+        self.g_net(np.zeros((1, self.params['z_dim']+self.params['nb_classes'])))
+        self.h_net(np.zeros((1, self.params['x_dim'])))
+        self.dz_net(np.zeros((1, self.params['z_dim'])))
+        self.dx_net(np.zeros((1, self.params['x_dim'])))
+        if print_summary:
+            print(self.g_net.summary())
+            print(self.h_net.summary())
+            print(self.dz_net.summary())
+            print(self.dx_net.summary())    
 
     @tf.function
-    def train_step(self, data_z, data_z_onehot, data_x, update=0):
-        """Update scDEC model given a batch of data.
+    def train_gen_step(self, data_z, data_z_onehot, data_x):
+        """train generators step.
         Args:
             inputs: input tensor list of 4
                 First item:  latent tensor with shape [batch_size, z_dim].
@@ -82,10 +81,12 @@ class scDEC(object):
                 Third item: obervation data with shape [batch_size, x_dim].
                 Fourth item: 0: update generators, 1: update discriminators
         Returns:
-                returns various of loss functions.
-        """
-        with tf.GradientTape(persistent=True) as tape:
-            data_z_combine = tf.keras.layers.Concatenate([data_z, data_z_onehot], axis=-1)
+                returns various of generator loss functions.
+        """  
+        with tf.GradientTape(persistent=True) as gen_tape:
+            data_x = tf.cast(data_x, tf.float32)
+            data_z_combine = tf.concat([data_z, data_z_onehot], axis=-1)
+            #print('1',data_z, data_z_onehot, data_x, data_z_combine)
             data_x_ = self.g_net(data_z_combine)
             data_z_latent_, data_z_onehot_ = self.h_net(data_x)
             data_z_ = data_z_latent_[:,:self.params['z_dim']]
@@ -95,7 +96,7 @@ class scDEC(object):
             data_z__ = data_z_latent__[:,:self.params['z_dim']]
             data_z_logits__ = data_z_latent__[:,self.params['z_dim']:]
             
-            data_z_combine_ = tf.keras.layers.Concatenate([data_z_, data_z_onehot_])
+            data_z_combine_ = tf.concat([data_z_, data_z_onehot_], axis=-1)
             data_x__ = self.g_net(data_z_combine_)
             
             data_dx_ = self.dx_net(data_x_)
@@ -104,12 +105,44 @@ class scDEC(object):
             l2_loss_x = tf.reduce_mean((data_x - data_x__)**2)
             l2_loss_z = tf.reduce_mean((data_z - data_z__)**2)
             
-            CE_loss_z = tf.nn.softmax_cross_entropy_with_logits(labels=data_z_onehot, logits=data_z_logits__)
+            CE_loss_z = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=data_z_onehot, logits=data_z_logits__))
             
             g_loss_adv = -tf.reduce_mean(data_dx_)
             h_loss_adv = -tf.reduce_mean(data_dz_)
             g_h_loss = g_loss_adv+h_loss_adv+self.params['alpha']*(l2_loss_x + l2_loss_z)+ \
                         self.params['beta']*CE_loss_z
+            
+        # Calculate the gradients for generators and discriminators
+        g_h_gradients = gen_tape.gradient(g_h_loss, self.g_net.trainable_variables+self.h_net.trainable_variables)
+        
+        # Apply the gradients to the optimizer
+        self.g_h_optimizer.apply_gradients(zip(g_h_gradients, self.g_net.trainable_variables+self.h_net.trainable_variables))
+        return g_loss_adv, h_loss_adv, l2_loss_x, l2_loss_z, CE_loss_z, g_h_loss
+      
+    @tf.function
+    def train_disc_step(self, data_z, data_z_onehot, data_x):
+        """train discrinimators step.
+        Args:
+            inputs: input tensor list of 4
+                First item:  latent tensor with shape [batch_size, z_dim].
+                Second item: latent onehot tensor with shape [batch_size, nb_classes].
+                Third item: obervation data with shape [batch_size, x_dim].
+                Fourth item: 0: update generators, 1: update discriminators
+        Returns:
+                returns various of discrinimator loss functions.
+        """  
+        epsilon_z = tf.random.uniform([],minval=0., maxval=1.)
+        epsilon_x = tf.random.uniform([],minval=0., maxval=1.)
+        with tf.GradientTape(persistent=True) as disc_tape:
+            data_x = tf.cast(data_x, tf.float32)
+            data_z_combine = tf.concat([data_z, data_z_onehot], axis=-1)
+            #print('1',data_z, data_z_onehot, data_x, data_z_combine)
+            data_x_ = self.g_net(data_z_combine)
+            data_z_latent_, data_z_onehot_ = self.h_net(data_x)
+            data_z_ = data_z_latent_[:,:self.params['z_dim']]
+            
+            data_dx_ = self.dx_net(data_x_)
+            data_dz_ = self.dz_net(data_z_)
             
             data_dx = self.dx_net(data_x)
             data_dz = self.dz_net(data_z)
@@ -118,7 +151,6 @@ class scDEC(object):
             dx_loss = -tf.reduce_mean(data_dx) + tf.reduce_mean(data_dx_)
             
             #gradient penalty for z
-            epsilon_z = tf.random.uniform([],minval=0., maxval=1.)
             data_z_hat = data_z*epsilon_z + data_z_*(1-epsilon_z)
             data_dz_hat = self.dz_net(data_z_hat)
             grad_z = tf.gradients(data_dz_hat, data_z_hat)[0] #(bs,z_dim)
@@ -126,29 +158,23 @@ class scDEC(object):
             gpz_loss = tf.reduce_mean(tf.square(grad_norm_z - 1.0))
             
             #gradient penalty for x
-            epsilon_x = tf.random.uniform([],minval=0., maxval=1.)
             data_x_hat = data_x*epsilon_x + data_x_*(1-epsilon_x)
             data_dx_hat = self.dx_net(data_x_hat)
             grad_x = tf.gradients(data_dx_hat, data_x_hat)[0] #(bs,x_dim)
             grad_norm_x = tf.sqrt(tf.reduce_sum(tf.square(grad_x), axis=1))#(bs,) 
             gpx_loss = tf.reduce_mean(tf.square(grad_norm_x - 1.0))
             
-            d_loss = dx_loss+dz_loss+self.params['gama']*(gpz_loss+gpx_loss)
+            d_loss = dx_loss + dz_loss + self.params['gamma']*(gpz_loss+gpx_loss)
         
         # Calculate the gradients for generators and discriminators
-        g_h_gradients = tape.gradient(g_h_loss, self.g_net.trainable_variables+self.h_net.trainable_variables)
-        d_gradients = tape.gradient(d_loss, self.dz_net.trainable_variables+self.dx_net.trainable_variables)
+        d_gradients = disc_tape.gradient(d_loss, self.dz_net.trainable_variables+self.dx_net.trainable_variables)
         
         # Apply the gradients to the optimizer
-        if update == 0:
-            self.g_h_optimizer.apply_gradients(g_h_gradients, self.g_net.trainable_variables+self.h_net.trainable_variables)
-        else:
-            self.d_optimizer.apply_gradients(d_gradients, self.dz_net.trainable_variables+self.dx_net.trainable_variables)
-        return g_loss_adv, dx_loss, h_loss_adv, dz_loss, l2_loss_x, l2_loss_z, CE_loss_z, g_h_loss, d_loss
-            
+        self.d_optimizer.apply_gradients(zip(d_gradients, self.dz_net.trainable_variables+self.dx_net.trainable_variables))
+        return dx_loss, dz_loss, d_loss
 
-    # Feed all batches data for epoch training        
-    def train_all(self): 
+    # Feed all batches data for epoch training     
+    def train(self): 
         batches_per_eval = 500
         ratio = 0.2
         batch_size = self.params['bs']
@@ -158,16 +184,15 @@ class scDEC(object):
         for batch_idx in range(self.params['nb_batches']):
             for _ in range(5):
                 batch_z, batch_z_onehot = self.z_sampler.train(batch_size, weights)
-                batch_x = self.x_sampler.train(batch_size)
-                self.train_step(batch_z, batch_z_onehot,batch_x, update=1)
+                batch_x = self.x_sampler.train(batch_size) 
+                dx_loss, dz_loss, d_loss = self.train_disc_step(batch_z, batch_z_onehot, batch_x)
             batch_z, batch_z_onehot = self.z_sampler.train(batch_size, weights)
             batch_x = self.x_sampler.train(batch_size)            
-            g_loss_adv, dx_loss, h_loss_adv, dz_loss, l2_loss_x, l2_loss_z, CE_loss_z, g_h_loss, d_loss = self.train_step(batch_z, batch_z_onehot,batch_x, update=0)
+            g_loss_adv, h_loss_adv, l2_loss_x, l2_loss_z, CE_loss_z, g_h_loss = self.train_gen_step(batch_z, batch_z_onehot,batch_x)
             if batch_idx % batches_per_eval == 0:
-                print('Batch_idx [%d] g_loss_adv [%.4f] h_loss_adv [%.4f] CE_loss_z [%.4f]\
-                    l2_loss_z [%.4f] l2_loss_x [%.4f] g_h_loss [%.4f] dz_loss [%.4f] dx_loss [%.4f] d_loss [%.4f]' %
-                    (batch_idx, g_loss_adv, h_loss_adv, CE_loss_z, l2_loss_z, l2_loss_x, \
-                    g_h_loss, dz_loss, dx_loss, d_loss))
+                #print(batch_idx, g_loss_adv, h_loss_adv, CE_loss_z, l2_loss_z, l2_loss_x, g_h_loss, dz_loss, dx_loss, d_loss)
+                print("Batch_idx [%d] g_loss_adv [%.4f] h_loss_adv [%.4f] CE_loss_z [%.4f] l2_loss_z [%.4f] l2_loss_x [%.4f] g_h_loss [%.4f] dz_loss [%.4f] dx_loss [%.4f] d_loss [%.4f]" % 
+                      (batch_idx, g_loss_adv, h_loss_adv, CE_loss_z, l2_loss_z, l2_loss_x, g_h_loss, dz_loss, dx_loss, d_loss))
                 self.evaluate(batch_idx)
                 ckpt_save_path = self.ckpt_manager.save()
                 print ('Saving checkpoint for epoch {} at {}'.format(batch_idx,ckpt_save_path))
@@ -188,25 +213,39 @@ class scDEC(object):
     def adjust_tiny_weights(self,weights,tol):
         idx_less = np.where(weights<tol)[0]
         idx_greater = np.where(weights>=tol)[0]
-        weights[idx_less] = np.array([np.random.uniform(2*tol,1./self.nb_classes) for item in idx_less])
+        weights[idx_less] = np.array([np.random.uniform(2*tol,1./self.params['nb_classes']) for item in idx_less])
         weights[idx_greater] = weights[idx_greater]*(1-np.sum(weights[idx_less]))/np.sum(weights[idx_greater])
         return weights   
-                
+
+    def estimate_weights(self,use_kmeans=False):
+        data_x = self.x_sampler.load_all()[0] if self.params['has_label'] else self.x_sampler.load_all()
+        data_z_, data_z_onehot_ = self.h_net.predict(data_x)
+        if use_kmeans:
+            from sklearn.cluster import KMeans
+            km = KMeans(n_clusters=self.params['nb_classes'], random_state=0).fit(np.concatenate([data_z_, data_z_onehot_],axis=1))
+            label_infer = km.labels_
+        else:
+            label_infer = np.argmax(data_z_onehot_, axis=1)
+        weights = np.empty(self.params['nb_classes'], dtype=np.float32)
+        for i in range(self.params['nb_classes']):
+            weights[i] = list(label_infer).count(i)  
+        return weights/float(np.sum(weights)) 
+
     def evaluate(self,batch_idx):
         has_label = self.params['has_label']
-        is_train = self.params['is_train']
+        train = self.params['train']
         if has_label:
             data_x, label_true = self.x_sampler.load_all()
         else:
             data_x = self.x_sampler.load_all()
-        data_z_, data_z_onehot_ = self.predict_z(data_x)
+        data_z_, data_z_onehot_ = self.h_net.predict(data_x)
         label_infer = np.argmax(data_z_onehot_, axis=1)
         if has_label:
             nmi = normalized_mutual_info_score(label_true, label_infer)
             ari = adjusted_rand_score(label_true, label_infer)
             homo = homogeneity_score(label_true,label_infer)
             print('scDEC: NMI = {}, ARI = {}, Homogeneity = {}'.format(nmi,ari,homo))
-            if is_train:
+            if train:
                 f = open('%s/log.txt'%self.save_dir,'a+')
                 f.write('NMI = {}\tARI = {}\tHomogeneity = {}\t batch_idx = {}\n'.format(nmi,ari,homo,batch_idx))
                 f.close()
@@ -214,45 +253,10 @@ class scDEC(object):
             else:
                 np.savez('results/{}/data_pre.npz'.format(self.data),data_z_,data_z_onehot_,label_true)    
         else:
-            if is_train:
+            if train:
                 np.savez('{}/data_at_{}.npz'.format(self.save_dir, batch_idx+1),data_z_,data_z_onehot_)
             else:
                 np.savez('results/{}/data_pre.npz'.format(self.data),data_z_,data_z_onehot_)
-        
-    #predict with x_=G(z)
-    def predict_x(self, z, z_onehot, bs=256):
-        assert z.shape[-1] == self.params['z_dim']
-        N = z.shape[0]
-        x_pred = np.zeros(shape=(N, self.params['x_dim'])) 
-        for b in range(int(np.ceil(N*1.0 / bs))):
-            if (b+1)*bs > N:
-               ind = np.arange(b*bs, N)
-            else:
-               ind = np.arange(b*bs, (b+1)*bs)
-            batch_z = z[ind, :]
-            batch_z_onehot = z_onehot[ind, :]
-            batch_x_ = self.g_net(np.concatenate([batch_z, batch_z_onehot], axis=1))
-            x_pred[ind, :] = batch_x_
-        return x_pred
-    
-    #predict with z_=H(x)
-    def predict_z(self,x,bs=256):
-        #return 
-        assert x.shape[-1] == self.params['x_dim']
-        N = x.shape[0]
-        z_pred = np.zeros(shape=(N, self.params['x_dim']+self.params['nb_classes'])) 
-        z_onehot = np.zeros(shape=(N, self.params['nb_classes'])) 
-        for b in range(int(np.ceil(N*1.0 / bs))):
-            if (b+1)*bs > N:
-               ind = np.arange(b*bs, N)
-            else:
-               ind = np.arange(b*bs, (b+1)*bs)
-            batch_x = x[ind, :]
-            batch_z_,batch_z_onehot_ = self.h_net(batch_x)
-            z_pred[ind, :] = batch_z_
-            z_onehot[ind, :] = batch_z_onehot_
-        return z_pred, z_onehot
-        
         
         
         

@@ -109,10 +109,9 @@ class scRNA_Sampler(object):
         else:
             return self.X 
 
-
 #scATAC data
 class scATAC_Sampler(object):
-    def __init__(self,name,dim=20,low=0.03,has_label=True):
+    def __init__(self,name,dim=50,low=0.03,has_label=True):
         self.name = name
         self.dim = dim
         self.has_label = has_label
@@ -134,6 +133,7 @@ class scATAC_Sampler(object):
         X = pca.transform(X)
         self.X = X
         self.total_size = self.X.shape[0]
+        print(self.X.shape, len(Y))
 
 
     def filter_peaks(self,X,ratio):
@@ -157,11 +157,7 @@ class scATAC_Sampler(object):
  
     def train(self, batch_size):
         indx = np.random.randint(low = 0, high = self.total_size, size = batch_size)
-
-        if self.has_label:
-            return self.X[indx, :], self.Y[indx]
-        else:
-            return self.X[indx, :]
+        return self.X[indx, :]
 
     def load_all(self):
         if self.has_label:
@@ -267,16 +263,16 @@ class Mixture_sampler(object):
         self.X_c = self.scale*np.random.normal(0, self.sd**2, (self.total_size,self.dim))
         #self.X_c = self.scale*np.random.uniform(-1, 1, (self.total_size,self.dim))
         self.label_idx = np.random.randint(low = 0 , high = self.nb_classes, size = self.total_size)
-        self.X_d = np.eye(self.nb_classes)[self.label_idx]
-        self.X = np.hstack((self.X_c,self.X_d))
+        self.X_d = np.eye(self.nb_classes, dtype='float32')[self.label_idx]
+        self.X = np.hstack((self.X_c,self.X_d)).astype('float32')
     
     def train(self,batch_size,weights=None):
-        X_batch_c = self.scale*np.random.normal(0, 1, (batch_size,self.dim))
+        X_batch_c = self.scale*np.random.normal(0, 1, (batch_size,self.dim)).astype('float32')
         #X_batch_c = self.scale*np.random.uniform(-1, 1, (batch_size,self.dim))
         if weights is None:
             weights = np.ones(self.nb_classes, dtype=np.float64) / float(self.nb_classes)
         label_batch_idx =  np.random.choice(self.nb_classes, size=batch_size, replace=True, p=weights)
-        X_batch_d = np.eye(self.nb_classes)[label_batch_idx]
+        X_batch_d = np.eye(self.nb_classes,dtype='float32')[label_batch_idx]
         return X_batch_c, X_batch_d
 
     def load_all(self):
